@@ -3,6 +3,7 @@ set -e
 
 # update build dependencies inside docker only
 if [ -f /.dockerenv ]; then
+    pip install --upgrade pip
     sudo pip install $(cat requirements.txt | grep 'pex==')
 fi
 
