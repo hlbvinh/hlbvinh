@@ -1,0 +1,12 @@
+# if filename ends with .txt will be indexed and part of dependabots requirement updates
+# https://github.com/dependabot/dependabot-core/blob/master/python/lib/dependabot/python/file_fetcher.rb
+# we'll update those requirements once we can mark them CI pipeline subdependencies
+
+# seems we'll need to add setuptools for newer versions of codecov
+certifi==2020.4.5.1
+chardet==3.0.4
+codecov~=2.1.0
+coverage==5.1
+idna==2.9
+requests==2.23.0
+urllib3==1.25.9
