@@ -1,0 +1,5 @@
+recursive-include skynet *.py
+recursive-include scripts *.py
+recursive-include airflow *.py
+include *.py
+include README.md

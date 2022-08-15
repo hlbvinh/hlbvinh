@@ -1,0 +1,14 @@
+# if filename ends with .txt will be indexed and part of dependabots requirement updates
+# https://github.com/dependabot/dependabot-core/blob/master/python/lib/dependabot/python/file_fetcher.rb
+# we'll update those requirements once we can mark them CI pipeline subdependencies
+filelock==3.0.12
+importlib-metadata==1.5.0
+packaging==20.1
+pluggy==0.13.1
+py==1.8.1
+pyparsing==2.4.6
+six==1.14.0
+toml==0.10.0
+tox==3.14.3
+virtualenv==16.7.9
+zipp==2.1.0

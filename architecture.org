@@ -1,0 +1,430 @@
+* how to read that file
+
+This file was written using [[https://orgmode.org/][org-mode]] an [[https://www.gnu.org/software/emacs/][emacs]] plugin. The format is pure text with a syntax similar to markdown. Github should be able to correctly display http-links as well as link to a file from the project, but unfortunately does not support following link to a specific source code line yet.
+
+The whole point of this document is to be able to refer to individual lines of code in the codebase, make sure you have emacs instaled with the latest org-mode version, [[https://www.spacemacs.org/][spacemacs]] should be able to handle that for you (simply add the [[https://www.spacemacs.org/layers/+emacs/org/README.html][org layer]] to the [[https://www.spacemacs.org/doc/QUICK_START.html#dotfile-spacemacs][.spacemacs configuration]].
+
+
+#+begin_src shell
+# install emacs
+# `sudo apt install emacs` on linux, and `brew cask install emacs` on mac
+
+# install spacemacs
+git clone https://github.com/syl20bnr/spacemacs ~/.emacs.d
+# use latest develop branch
+cd .emacs.d
+git checkout develop
+
+# start emacs to create .spacemacs file in your home folder
+emacs
+
+# quit emacs add org layer
+# edit .spacemacs file in your home folder
+# add org to the list of layers under dotspacemacs-configuration-layers, for instance
+
+# ;; List of configuration layers to load.
+# dotspacemacs-configuration-layers
+# '(
+#   ;; ----------------------------------------------------------------
+#   ;; Example of useful layers you may want to use right away.
+#   ;; Uncomment some layer names and press `SPC f e R' (Vim style) or
+#   ;; `M-m f e R' (Emacs style) to install them.
+#   ;; ----------------------------------------------------------------
+#   ;; auto-completion
+#   ;; better-defaults
+#   emacs-lisp
+#   ;; git
+#   helm
+#   ;; lsp
+#   ;; markdown
+#   multiple-cursors
+#   org  <-!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! uncomment or add org here !!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#   ;; (shell :variables
+#   ;;        shell-default-height 30
+#   ;;        shell-default-position 'bottom)
+#   ;; spell-checking
+#   ;; syntax-checking
+#   ;; version-control
+#   treemacs)
+
+
+# start emacs again and check that everything is displayed correctly
+emacs path/to/../architecture.org
+#+end_src
+
+
+* deployment script
+
+we use fabric to [[file:fabfile.py::def deploy(service=None, build_num=None, dag_name=None):][deploy]] the [[https://github.com/pantsbuild/pex][PEX]] created on CirleCI, 
+
+~service~ corresponds to the services running under supervisor on the pred instances.
+~build_num~ refers to the CircleCI build number
+
+Instructions to deploy code can be found in the [[https://github.com/AmbiLabs/ambi_brain/wiki/Pushing-Code][wiki]] as well as the [[file:README.md::Deploy][readme]].
+
+Appart from deploy, we'll sometimes clean disk space by [[file:fabfile.py::def remove_extracted_pex_artifacts():][removing the pex caching folder]] on the instances, or by simply deleting [[file:fabfile.py::def clean(n_keep=10):][previous pex deployment]]
+
+At the moment we are saving hosting cost by keeping the pred instance pred4 down, we can reflect this in the deployment script by modifying the [[file:fabfile.py::"pred": \[f"pred{i}.ai" for i in range(1, 5)\],][relevant section]] to indicate which pred instances are currently running.
+The best would be to actually still deploy to pred4: start the instance and make the deployment then shut it down again. That way pred instances won't start to drift in terms of configuration. This has been done on the backend side and the AI should update the fab script as well.
+
+Careful not to interupt of deployment, you could endup with a half downloaded pex, problems with file ownership or linkage.
+The quickest way to recover is simply to remove the pex and reinstall. This can be done by removing all the pex with:
+#+begin_src shell
+fab production pred clean:n_keep=0
+#+end_src
+You should then be able to reinstall the pex using install.
+
+* entry points
+
+The PEX files contains the code necessary to run every possible service.
+
+Those services are from the /scripts folder.
+
+To modify the entry points and add a new service you'll have to edit the [[file:scripts/__main__.py::SERVICES = \[][list of services]].
+
+
+* skynet
+
+The scripts just initialise databases and connections, before invoking the main logic that resides in the /skynet folder
+
+The [[file:scripts/control_service_failover.py::async def control_service_failover(cnf: Config) -> None:][control service failover]] makes sure that only one control process is running amongst the pred instances.
+The election problem is easily solved with a [[file:scripts/control_service_failover.py::if await can_get_lock(lock):][redis lock]].
+
+The [[file:skynet/control/control.py::class Control:][control]] process has only two tasks:
+- [[file:skynet/control/control.py::class ListenerQueue:][listening]] to the event service and enqueue events in redis
+- run [[file:skynet/control/control.py::class PeriodicalUpdate:][periodic tasks]]
+
+events are simply [[file:skynet/utils/cache_util.py::async def enqueue_event(redis: Redis, msg: List\[bytes\]) -> None:][enqueued]] by topics in redis
+
+The [[file:skynet/control/control.py::class ControlWorker:][control worker]] currently processes [[file:skynet/control/control.py::for worker_id in range(CONTROL_CONCURRENCY):][up to 10 events]] at a time in each process.
+This limit in concurrency is dictated by aredis (bug in a redis not releasing connections properly so we try to fix the pool size) and the size of sensor burst from the event service (if suddenly we get 100 sensors, each will could trigger a comfort model prediction and as that resource is finite with a connection timeout, we'll most likely have timeouts) and provides a back pressure mechanism.
+
+We make sure that [[only one update][only one update]] can be done to a given device at a time, 
+and if the events require an update we'll then [[file:skynet/control/control.py::await event.update_controller(controller)][start a Controller]] to perform the update.
+
+The events that can be received from the events service are represented using a [[file:skynet/utils/events.py::class Event:][common abstraction]]
+This abstraction makes it easy to process new types of events: for example [[file:skynet/utils/events.py::class SensorEvent(Event):][sensor events]]
+
+The actually events parsing and schema are stored in a separate file, for instance a [[file:skynet/utils/event_parsing.py::CONTROL_TARGET_SCHEMA = Schema(][control target schema]].  
+Controllers for a device are created for an event and then destroyed, the controller has to be stateless so that any worker process can perform an update. This is achieved by storing all the information needed for the controller to run properly in Redis. In particular the state of the controller is [[file:skynet/utils/events.py::await controller.store_state()][stored after the update finishes]].
+To create the controller all the necessary information (past event and current controller state) is fetched from redis [[file:skynet/control/controller.py::async def from_redis(][and loaded]].
+
+
+The work of the controller is split accross many small classes by functionality that are all located under /skynet/control.
+For instance [[file:skynet/control/controller.py::self.deploy = deploy.Deploy(][Deploy]] will take care of deploying a given state, while [[file:skynet/control/controller.py::self.comfort = comfort.Comfort(][Comfort]] handles comfort predictions.
+
+The routing logic is contained in the [[file:skynet/control/controller.py::async def update_state(self):][state update]] where the control target is passed through a switch statement .
+
+The most complex updates are related to the [[file:skynet/control/controller.py::settings = await self.tracking.get_best_setting()][tracking modes]] (comfort, temperature)
+
+In case of comfort mode the target that we track changes with each [[file:skynet/control/controller.py::await self.target.update_value()][update]], while for temperature the value is fixed by the user.
+
+** tracking mode
+
+Tracking mode is a combination of machine learning and control logic, an attempt to track the user target (comfort, temperature, ...) by continuously adjusting the AC state.
+
+Overall we use machine learning to get [[file:skynet/control/tracking.py::states, predictions = await self.prediction.get_predictions()][predictions]] of how close potential states are from the target, we then select a potential 
+[[file:skynet/control/tracking.py::best_setting = self.select_best_setting(predictions, states)][best state]] out of the ml suggestions, if the state seems like a [[file:skynet/control/tracking.py::if not util.state_update_required(][good idea]], we then try to [[file:skynet/control/controller.py::).update_deployment(settings)][deploy it]].
+
+*** predictions
+
+Predictions can be separated in two steps:
+- [[file:skynet/control/prediction.py::best_mode = await prediction_service.get_mode_prediction(][pick]] an AC mode
+- [[file:skynet/control/prediction.py::predictions = await prediction_service.get_climate_prediction(][predict]] for various [[file:skynet/control/prediction.py::states_to_predict = prediction_util.get_states_to_predict(][set points]] of that mode how the AC would react
+
+
+**** features
+
+ We need [[file:skynet/control/prediction.py::history_features = self.feature_data.get_history_features()][features]] to make predictions, in case of the climate and mode model the features are fairly similar.
+ The common part is handle by the [[file:skynet/sample/feature_cache.py::class FeatureData:][FeatureData]] class. As the controller itself needs to be stateless so that computations can be 
+ distributed on any active control worker, ongoing features are [[file:skynet/sample/feature_cache.py::class RedisFeatureData(FeatureData):][stored in redis]]. [[file:skynet/control/controller.py::await multi(\[self.load_state(), self.update_feedback_humidex()\])][Loading]] is handled while creating the controller, while saving is handled at the end of the [[file:skynet/utils/events.py::await controller.store_state()][event processing]].
+
+**** mode selection
+
+ the mode selection itself is a combination of machine learning prediction and logic filtering:
+ the [[file:skynet/prediction/mode_selection.py::def mode_selection(self) -> types.ModeSelection:][selection]] needs to match the control target mode restriction as well as what the AC supports.
+ The selection can also be [[file:skynet/prediction/mode_selection.py::def overriding_mode(self) -> Optional\[str\]:][overridden]] by a [[file:skynet/utils/events.py::class ModeFeedbackEvent(Event):][mode feedback]], which itself can be overridden by a [[file:skynet/utils/events.py::class FeedbackEvent(Event):][feedback]] if the user [[file:skynet/prediction/mode_selection.py::and self.latest_feedback\["feedback"\] != 0][feels uncomfortable]].
+ The user own [[file:skynet/utils/events.py::class ModePreferenceEvent(Event):][mode preferences]] are also [[file:skynet/prediction/mode_selection.py::self.mode_preferences, self.target.mode_pref_key][taken into account]].
+ Finally we also have some [[file:skynet/prediction/mode_selection.py::return mode_filtering.filter_mode_selection(][domain knowledge]] on mode selection, that prevents picking some modes based on the current room situation.
+
+ the model model [[file:skynet/prediction/prediction_service.py::mode_probas = await prediction_service_client(][predictions]] are then [[file:skynet/prediction/prediction_service.py::best_mode = mode_model_util.mode_model_adjustment_logic(][filtered]] one last time
+
+ The model model itself is actually a combination of multiple logistic regression models. Different models are trained for each possible combinations of AC modes, mode features also depends on [[file:skynet/prediction/mode_model.py::MINI_MODELS_FEATURES = {][that selection]]:
+ for instance when choosing between [[file:skynet/prediction/mode_model.py::("cool", "heat"): \["humidex_out", "temperature_out_mean_day", "target"\],][heating and cooling]], only the outer weather and the desired room conditions are taken into account.
+ Multiple models are trained rather than a single one to make sure that the predict probabilities do not need to be adjusted based on the user mode preference selection.
+ Internally the mode model relies on a [[file:skynet/prediction/mode_model.py::q: mode_model_util.MultiModesEstimator(][MultiModesEstimator]]. This meta estimator combines different models and relies on a single [[file:skynet/prediction/mode_model_util.py::"first_layer": first_layer_estimator,][two layers architecture]]:
+ - we first use decide whether we should be heating or cooling
+ - based on the result we run another model with either [[file:skynet/prediction/mode_model_util.py::proba.update(dict(zip(self.cool_modes, second_layer_cool)))][cooling]] or [[file:skynet/prediction/mode_model_util.py::proba.update(dict(zip(self.heat_modes, second_layer_heat)))][heating modes]]
+
+
+**** states predictions
+
+Once the mode is picked, we'll predict the future room conditions using the [[file:skynet/prediction/climate_model.py::class ClimateModel(model.Model):][Climate model]] for [[file:skynet/control/prediction_util.py::for temperature in ir_feature\[mode\]\["temperature"\]\["value"\]][every different temperature value]] supported by the ir profile of that mode.
+
+In comfort mode, we'll predict future temperature, humidity and humidex. In temperature mode [[file:skynet/control/prediction.py::self.target.climate_model_quantity,][only the temperature]] is predicted.
+
+The action predictions from the climate model are variations with respect to the current values, using [[file:skynet/prediction/climate_model.py::TRAIN_USING_RELATIVE_TARGET = True][relative]] rather than absolute predictions makes it easier to train a robust model. But the actual output gives the [[file:skynet/prediction/predict.py::predictions = np.add(][absolute value]] no matter how the model is actually trained.
+
+Because of the kirks of the Climate model, predictions are not always monotonically aligned with the set points and we have frequent inversion (eg. 24 is predicted to cool more than 23), the [[file:skynet/control/prediction.py::if SORT_PREDICTIONS:][postprocessing fix]] is currently disabled: when the range of prediction is too small sorting them properly will result in big set point change (jumping from 16 to 30 as the target changes)
+
+We need to make sure that the final output is matching the tracked quantity, in case of comfort we transform the temperature, humidity and humidex predictions of the Climate model back to a comfort quantify by chaining a [[file:skynet/control/prediction.py::await self.target.from_climate_predictions(predictions),][Comfort model call]].
+
+
+**** prediction service
+
+all the model predictions run by the Controller are actually executed in a separate process of the same instance: each model has it's own [[file:scripts/prediction_service.py::if model_type == "climate":][prediction service]].
+
+A prediction service is a simple process that relies on a [[file:skynet/prediction/prediction_service.py::class PredictionService(MicroService):][Microservice]]. This abstraction is from ambi_utils and is used throughout ambi codebase. A microservice is simply of group of Actors and acts as a routing mechanism for rpc calls over zmq.
+
+The actual prediction actor is a combination of a [[file:skynet/utils/storage.py::class Loader:][loader]] and a [[file:skynet/prediction/prediction_service.py::class PredictionActor(Actor, metaclass=abc.ABCMeta):][predictor]]. The climate model illustrates how easy the creation of that actor [[file:skynet/prediction/prediction_service.py::class ClimateModelActorReload(ModelReloadActor, ClimateModelActor):][is]].
+
+The loader is [[file:skynet/user/comfort_model.py::RELOAD_INTERVAL_SECONDS = TRAINING_INTERVAL_SECONDS / 10][periodically]] reloading the model from a [[file:scripts/prediction_service.py::@click.option("--storage", type=click.Choice(\["s3", "file"\]), default="s3")][storage]] (file to test things locally or S3 bucket on staging and production).
+
+Models stored in S3 are tagged by the [[file:skynet/prediction/prediction_service.py::"climate_model": {"climate_model": climate_model.ClimateModel.get_storage_key()},][model type and version number]] as well as [[file:skynet/utils/storage.py::def tag_key(fun):][other tags]]. These other tags are here to make sure that the version of the software that was used to train the model is the same at prediction time (python version, sklearn/pytorch version, ...).
+
+The service can then be used from the Controller simply by using a [[file:scripts/control_worker.py::dealer_actor = DealerActor(log=log, **service_cnf)][DealerActor]] to communicate through zmq to the [[file:skynet/control/prediction.py::predictions = await prediction_service.get_climate_prediction(][right process]].
+
+**** state selection
+
+We now have predictions of a future target delta for different AC states, we now want to evaluate those predictions in order to [[file:skynet/control/tracking.py::best_setting = self.select_best_setting(predictions, states)][select the best setting]] to be deployed to the AC to reach the tracking control target.
+
+For each state we associate a [[file:scripts/prediction_service.py::if model_type == "climate":][deviation]] from the desired target value.
+
+To prevent the control algorithm to continuously change the best setting and stabilise the models predictions, the deviations are [[file:skynet/control/tracking.py::penalized_deviations = self.penalise_deviation_from_current_temperature(][penalized]]. The actual penalty for each set point depends on [[file:skynet/control/tracking.py::self.penalty_factor * error_factor * predicted_error_factor * time_factor][multiple factors]], the goal is to make sure that the current set point keeps getting selected as long as the control is good (not too far from the target).
+
+The [[file:skynet/control/tracking.py::best_setting = states\[np.argmin(penalized_deviations)\].copy()][best setting]] is then selected as the one minimizing the penalised deviations.
+
+***** Deviation tracker
+
+ This best setting will be further adjusted by the [[file:skynet/control/tracking.py::\] = self.deviation_tracker.get_set_temperature_with_offset(][deviation tracker]].
+
+ The [[file:skynet/control/adjust.py::class DeviationTracker:][deviation tracker]] is used to keep track of the control errors other time and to override the best setting temperature by applying an [[file:skynet/control/adjust.py::new_temp = float(best_tempset) + self._offset][offset]]. The offset varies between -4 and [[file:skynet/control/adjust.py::MAX_OFFSET = 4][4 set point]], by [[file:skynet/control/adjust.py::offset = max(offset - 1, limit)][step of 1]] set point every [[file:skynet/control/adjust.py::MIN_SECONDS = 300.0][5 minutes]].
+ The [[file:skynet/control/adjust.py::return (][rules]] are quite simple: if we are far from the target and extrapolating the direction does not look like we'll get better then it's time to adjust.
+ The tracker stores the errors in a [[file:skynet/control/adjust.py::self.errors: Deque\[float\] = deque(maxlen=N_ERRORS_KEEP)][deque]], as usually we have a controller update every [[file:skynet/control/util.py::UPDATE_INTERVAL_SECONDS = max(][1 minute]], the queue should store about [[file:skynet/control/adjust.py::N_ERRORS_KEEP = 60][1 hour]] of data.
+ The deviations are only stored [[file:skynet/control/adjust.py::if best_mode != self._current_mode or self.error_stream.crossed_target(error):][till]] we reach the target or the mode is changed. When computing the [[file:skynet/control/adjust.py::weights=np.flip(np.exp(-np.arange(len(self.errors)) / ERROR_DECAY_TAU)),][average error]], we put more weight for recent data, we also somehow take care of the fact that cooling is not linear ala newton's law and [[file:skynet/control/adjust.py::> self.adjusted_max_seconds()][adjust for it]].
+
+***** Maintain
+
+ The deviation tracker is not the final postprocessing step: we also have a [[file:skynet/control/tracking.py::best_setting\["temperature"\] = self.maintain.maintain_temperature(][maintain logic]].
+ The [[file:skynet/control/maintain.py::class Maintain:][maintain]] logic attempts to bypass the AI: if we are already close to the target is AI really necessary, adjusting by +1 -1 could be enough to maintain the current close enough to the target.
+ This time the [[file:skynet/control/maintain.py::self.maintain_tracker = TimeQueue(TRACK_DURATION)][maintain tracker]] storing the errors is time based and limited to the last [[file:skynet/control/maintain.py::TRACK_DURATION = timedelta(minutes=20)][20 minutes]], this is supposed to be enough to determine whether or not the current set point would be enough to [[file:skynet/control/maintain.py::def is_maintaining(self) -> bool:][maintain the current conditions]].
+ Unfortunately the current implementation is too simplistic (putting the AC on 16 and passing through the target would still count as maintaining...), we have an ongoing a/b testing experiment to add [[file:skynet/control/adjust.py::if self.error_stream.errors_not_getting_better():][the trend]] correction.
+ And last but not least the [[file:skynet/control/maintain.py::new_tempset -= 1][+-1 adjustment logic]] does not actually work, this will need to be addressed and is related to the fact that we use the [[file:skynet/control/maintain.py::and self.error_stream.errors_not_getting_better()][error_stream implementation]] to decide whether or not to adjust, but by default the error stream [[file:skynet/control/adjust.py::MEAN_THRESHOLD = 0.5][diverging threshold]] is 0.5 while the [[file:skynet/control/maintain.py::MAINTAIN_THRESHOLD = 0.45][maintain threshold]] is set to 0.45.
+ This simply means that we'll quit maintain mode before realising that we need to perform an adjustment.
+ This is quite problematic as one of the current issue with the maintain logic is that the control we'll be stuck on a setting for too long (16 cooling) and when the AI takes back control it we'll over compensate by deploying a set point with a big jump (30 cooling). Worse case and this adds some sort of weird oscillation/bang-bang control that is quite likely to annoy our users.
+
+**** state deployment
+
+Once settle on a potential update we'll still need to check whether the update even [[file:skynet/control/tracking.py::if not util.state_update_required(][make sense]]. We'll prevent deploying [[file:skynet/control/util.py::if has_same_temperature(signal\["temperature"\], state\["temperature"\]):][the same]] set point to avoid unnecessary beeps. We'll also make sure that the direction of the error [[file:skynet/control/util.py::return likely_better(signal\["temperature"\], state\["temperature"\], target_delta)][matches]] the set point change direction: if we need to heat then the set point should increase.
+
+Deployment is then performed, the [[file:skynet/utils/types.py::BasicDeployment = NamedTuple(][BasicDeployment]] needs to be [[file:skynet/control/deploy.py::deployment_settings = await util.adjust_deployment_settings(][converted]] to a full appliance state. Some extra logic related to [[file:skynet/control/util.py::coroutines\["fan"\] = get_fan_setting(][fan settings]] are hidden in there, other settings not controlled by the AI are usually just [[file:skynet/utils/ir_feature.py::signal\["louver"\] = property_value("louver", last_on_state, last_on_state, feat)][propagated]].
+
+
+
+** away mode
+
+Compare to tracking modes, [[file:skynet/control/controller.py::settings = await self.away_mode_update_settings()][away mode updates]] are much simpler, based on the control target and the room conditions we'll simply [[file:skynet/control/controller.py::action = util.away_mode_action(self.is_ac_on, condition, timed_out, new)][assess]] whether to [[file:skynet/control/controller.py::return await self.get_away_mode_settings()][update the set point]] or simply [[file:skynet/control/controller.py::return self.deploy.off_deployment][turn off the AC]].
+
+Away mode still relies on [[file:skynet/control/controller.py::states, predictions = await self.prediction.get_predictions()][model predictions]] to perform the update, we get the very same state predictions as for the tracking modes: the mode model will select which would be the most appropriate mode and the climate model will predict the future value of the [[file:skynet/utils/event_parsing.py::control_mode, quantity, threshold_type = parse_quantity_field(][quantity]] (temperature or humidity) selected as target in away mode.
+
+Machine learning does not really need to be involved if we limit ourselves to away temperature, we could simply heat using heat mode when a lower threshold type is set and cool otherwise, while picking respectivetly the highest and lowest set points.
+This has been recently [[file:skynet/control/setting_selection.py::if quantity == "temperature":][been implemented]], although the models are still used the predictions are discarded. Most likely this logic could be applied to a humidity quantity but so far we still use predictions to [[file:skynet/control/setting_selection.py::return states\[np.argmin(predictions)\]][achieve that effect]].
+
+** turn off mode
+
+Most AI deployments are for an AC turned on: tracking mode only deploys [[file:skynet/control/prediction_util.py::{"power": Power.ON, "mode": mode, "temperature": temperature}][on states]], away mode can potentially turn the AC off though as we have already seen. A [[file:skynet/control/controller.py::if self.target.control_mode == "off" or self.target.turn_off_appliance:][third case]] is when the control mode is set to off, this happens for timer and geolocation actions that require the AC to be turned off, as long as the device is in that mode AI will quick the AC state off.
+
+Although it has not been used so far, an AC could also be [[file:skynet/control/target.py::return self.adr.turn_off_appliance][turned off]] during an ADR event if the [[file:skynet/control/target.py::OFF_SIGNAL_LEVEL = 1][right signal]] is received.
+
+** managed manual
+
+Currently [[file:skynet/control/controller.py::settings = await self.get_managed_manual_settings()][managed manual]] is only used during ADR event for user currently using Manual mode in order to override their current  AC settings. Backend is currently not able to send a proper change of control target and AI needs to [[file:skynet/control/controller.py::control_target\["quantity"\] = "managed_manual"][simulate that change]] so far.
+
+The logic is [[file:skynet/control/managed_manual.py::temperature=self._determine_set_temperature(][rather simple]], the [[file:skynet/control/managed_manual.py::most_used_mode = df.groupby("mode").duration.sum().idxmax()][mode used the most]] as well as the [[file:skynet/control/managed_manual.py::mean_temperature_set = self._weighted_average(][average set point]] are computed over the last [[file:skynet/control/managed_manual.py::AVERAGE_PERIOD = timedelta(weeks=2)][2 weeks period]].
+The Target class relies on that [[file:skynet/control/target.py::self._target_value = await self.managed_manual.get_target_value()][value]] to fix the current desired temperature, and once the ADR offset has [[file:skynet/control/target.py::return self._target_value + self.adr_penalty][been applied]], the set point [[file:skynet/control/managed_manual.py::return min(][closest to the desired temperature]] will simply be deployed.
+
+* a/b testing
+
+Skynet has a simple tool to perform a/b testing and branching on code: [[file:skynet/utils/progressive_rollout.py::class Experiment:][Expirements]]
+
+The controller will be looking for experiments listed [[file:skynet/control/controller.py::self.experiments: List\[Experiment\] = \[\]][here]], the usage is simple enough:
+#+begin_src python
+        self.experiments: List[Experiment] = [
+            Experiment(self.connections.redis, self.device_id, "maintain_trend")
+        ]
+#+end_src
+this will force the controller to check for [[file:skynet/control/controller.py::await multi(\[experiment.update() for experiment in self.experiments\])][each experiment]] whether or not the device [[file:skynet/utils/progressive_rollout.py::def is_in(experiment: str, experiments: List\[Experiment\]) -> bool:][is in]]. This can be quickly used to select a different code path at the device level.
+
+Experiments also support [[file:skynet/utils/progressive_rollout.py::PROGRESSIVE_PROPORTIONS = \[0.0, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0\]][progressive rollout]], a [[file:skynet/utils/progressive_rollout.py::self.coin_flip = random()][random]] fixed proportion of the users will be assigned to the in group based on the [[file:skynet/utils/progressive_rollout.py::return self.coin_flip < PROGRESSIVE_PROPORTIONS\[self.level\]][experiment level]].
+The current experiment level can be changed using a [[file:utils/progressive_rollout.py::elif task == "set_level":][util script]]. Other functionalities are provided:
+we can [[file:utils/progressive_rollout.py::run_sync(set_hardcoded, connections.redis, experiment)][hardcode]] devices to be [[file:utils/progressive_rollout.py::HARDCODED_DEVICES: Dict\[str, List\[Dict\[str, List\[str\]\]\]\] = {}][white or blacklisted]]
+#+begin_src python
+HARDCODED_DEVICES: Dict[str, List[Dict[str, List[str]]]] = {
+    "remove_time_factor": {
+        "whitelist": """
+    649430f1-7cb1-4f17-9e96-41fe4537013d
+    d787b12e-66ef-43b2-ad7c-565d2e21e96b
+    dca76796-06eb-45de-8bf8-226f9c7240b2
+    """.split(),
+        "blacklist": """""".split(),
+    }
+}
+#+end_src
+
+Once on the level 6, 100% of the users will be part of the experiment (apart from the blacklisted devices). We can then remove the experiment branching and make the new code permament, don't forget to [[file:utils/progressive_rollout.py::run_sync(delete, connections.redis, experiment)][clean redis]] as well.
+
+Redis connection instructions are [[https://github.com/AmbiLabs/ambi_brain/wiki/Progressive-rollout][on the wiki]]
+
+
+* Model training
+
+- sample creation
+- sample filtering
+
+Models are trained on a separate instance: [[file:fabfile.py::"train": \["train1.ai"\],][train]]. This instance runs periodic tasks using [[https://airflow.apache.org/docs/stable/][Airflow]].
+Once this [[https://github.com/AmbiLabs/ambi_brain/wiki/AWS-Connections][instance connection]] is redirected locally the [[https://github.com/AmbiLabs/ambi_brain/wiki/System-checks#model-training][airflow dashboard]] can be launched for monitoring.
+
+We currently run two Directed Acyclic Graphs (DAGS):
+- [[file:airflow/dags/climate_models.py::dag = DAG(][climate models]] currently running every [[file:airflow/dags/climate_models.py::interval = timedelta(hours=20)][20 hours]]
+- [[file:airflow/dags/user_models.py::dag = DAG(][user models]] also running every [[file:airflow/dags/user_models.py::interval = timedelta(hours=20)][20 hours]]
+ 
+The dags have multiple tasks and step but can be simply divided into phases:
+- [[file:airflow/dags/user_models.py::task_id="user_sample_generator",][sample creation]]
+- [[file:airflow/dags/user_models.py::task_id="comfort_model_training",][model training]]
+
+** comfort model
+
+ For the comfort model, the entry path to sample creation is the [[file:airflow/dags/user_models.py::f"{pex_path} user_sample_generator --config {config_path} "][user_sample_generator]] [[file:scripts/user_sample_generator.py][script]]
+
+ The created samples are stored in mongo for convience. We have a [[file:skynet/utils/sample_store.py::class SampleStore:][SampleStore]] abstraction to interact with mongo which takes care of sample [[file:skynet/utils/sample_store.py::def upsert(self, sample):][insertion]] and [[file:skynet/utils/sample_store.py::def get(self, key={}, sort=None, limit=0, direction=pymongo.ASCENDING):][retrieval]], we also have the concept of [[file:skynet/user/store.py::WATERMARK_COLLECTION = "user_model_watermarks"][watermarks]] storing for every [[file:skynet/user/store.py::WATERMARK_KEY = "device_id"][device]] the [[file:skynet/user/store.py::WATERMARK_VALUE = "timestamp"][timestamp]] of the last sample creation so that dags can [[file:skynet/user/sample.py::max(d\["start"\], watermark)][carry on from that point]] for the next sample creation execution.
+
+ Comfort sample creation is performed for [[file:skynet/user/sample.py::online_data = await pool.execute(*queries.query_feedback_intervals())][every device]] each time and runs concurrently with a [[file:skynet/user/sample.py::semaphore = asyncio.Semaphore(SAMPLE_CONCURRENCY)][semaphore]] to prevent to many calls to the database.
+
+ The data fetch and upload logic is [[file:skynet/user/sample.py::async def fetch_upload_samples(][quite simple]].
+ For each device we fetch the [[file:skynet/user/sample.py::feedback_query = queries.query_user_feedback(][new feedbacks]], feedbacks that lasted less than one minute are [[file:skynet/user/sample.py::filtered = preprocess.filter_time_between(MIN_FEEDBACK_INTERVAL, feedback_rows)][filtered out]], the then proceed to fetch all the associated data needed to [[file:skynet/user/sample.py::fetch_feedback_sample(pool, session, device_id, feedback)][create a sample]] for each feedback.
+ Data is [[file:skynet/user/sample.py::async def fetch_non_feedback_features(][fetched]] from both mysql and cassandra. Cassandra is where our [[file:skynet/user/sample.py::"sensors": fetch_sensors_timestamp(session, device_id, timestamp),][sensors]] are located, while all the rest is stored in mysql.
+
+ The current sensor seems to be the average of the [[file:skynet/user/sample.py::features.update(average(recent(sensors, RECENT_SENSORS_TIMEDELTA)))][last 2 minutes]], which unfortunately is not matched on the controller comfort prediction [[file:skynet/sample/feature_cache.py::f = {k: sensors\[k\] for k in \["temperature", "humidity", "humidex"\]}][features]] side (although it should be easy to address).
+
+ The list of [[file:skynet/user/sample.py::FEATURES_STORED = (][stored features]] can be compared to the [[file:skynet/user/sample.py::COMFORT_FEATURES_TRAIN = (][features]] used to train the model.
+
+The script used to train the comfort model can be used for different [[file:scripts/comfort_model.py::type=click.Choice(\["train", "score", "test", "predict", "grid_search"\]),][tasks]], but here we'll just focus on the [[file:scripts/comfort_model.py::elif task == "train":][training process]].
+
+Raw training data is loaded from [[file:scripts/comfort_model.py::samples = sample_store.get_samples_sorted_by_timestamp_desc(][mongo]], currently we fetch the last [[file:scripts/comfort_model.py::default=14,][14 months]] of associated feedback data.
+
+The model is then simply [[file:scripts/comfort_model.py::def train_model(dataset: pd.DataFrame, model_store, n_jobs: int) -> None:][trained and stored]] in s3
+
+The [[file:skynet/user/comfort_model.py::class ComfortModel(model.Model):][model]] is a wrapper around a [[file:skynet/prediction/estimators/comfort_model_estimator.py::def get_pipeline(bypass=True, estimator=None):][sklearn pipeline]], that pipeline combines several steps, from [[file:skynet/prediction/estimators/comfort_model_estimator.py::"filter",][feature filtering]], adding a [[file:skynet/prediction/estimators/comfort_model_estimator.py::estimator = nnet_utils.EmbeddedRegression(][pytorch nnet]] wrapped as a sklearn model, to some custom [[file:skynet/utils/sklearn_wrappers.py::class PipelineWithSampleFiltering(Pipeline):][sample filtering]].
+
+Just before the actual training, the mongo samples go through an [[file:skynet/user/sample.py::def prepare_dataset(dataset):][final processing step]] before being [[file:skynet/user/comfort_model.py::def split(dataset):][split]] between features and targets
+
+The [[file:skynet/utils/nnet_utils.py::class EmbeddedRegression(BaseEstimator, RegressorMixin):][underlying nnet model]] is using pytorch and closely matches the nnet sklearn equivalent. We use pytorch so that more advance nnet layers can also be implemented: we also have an [[file:skynet/prediction/estimators/comfort_model_estimator.py::estimator = nnet_utils.SequenceEmbeddedRegression(][lstm implementation]], although currently this implementation is not used as the computational cost of running the lstm is not offset by a huge improvement of the model performance. The fact that we create an [[file:skynet/prediction/estimators/comfort_model_estimator.py::estimator = AverageEstimator(estimator=estimator, n_estimators=8, n_jobs=1)][ensemble of models]] (currently 8) in order to reduce variability between new trained versions would also explain why the computational cost is already high.
+
+After training, the model is [[file:skynet/utils/storage.py::def save(self, key: Dict\[str, Any\], obj: Any) -> None:][stored in S3]], as previously mentioned the model is actually indexed based on the [[file:scripts/comfort_model.py::model_store.save(model.storage_key, model)][storage_key]] that depends on the model type, version number as well as other metadata parameters such as python version...
+
+** climate model
+
+As for the comfort model, climate model training loop starts with the [[file:airflow/dags/climate_models.py::task_id="sample_generator",][sample generator]] (which is common to both the climate and mode model).
+
+Rather than a comfort sample store we now have a [[file:scripts/sample_generator.py::sample_store = ClimateSampleStore(][climate one]]. The samples are [[file:skynet/sample/sample.py::async def generate_samples(][generated]] and once again stored in mongo. For every device we'll start [[file:skynet/sample/sample.py::await make_upload_device_samples(][creating]] samples from the last mongo watermark. Climate samples are based on [[file:skynet/sample/sample.py::appliance_states = await get_appliance_states_from_just_before_start_till_end(][appliance states]], we want to know how the AC states influences the room conditions, and the unit of the sample is simply a period with the AC on the [[file:skynet/sample/sample.py::samples.append(][same state]] (the state needs to be [[file:skynet/sample/sample.py::if next_state\["created_on"\] - current_state\["created_on"\] < timedelta(minutes=5):][long enough]]).
+
+Data is [[file:skynet/sample/sample.py::result = await multi(][fetched]] from both mysql and cassandra. 
+So far the sample could have been a few hours long (time between state change), we actually restrict it to [[file:skynet/sample/sample.py::SAMPLE_IVAL = "3H"][3 hours]] and sub [[file:skynet/sample/sample.py::self.timestamp, last_time - TARGET_INTERVAL, freq=SAMPLE_IVAL, closed="left"][decompose it]]
+
+One important step is the actual [[file:skynet/sample/sample.py::target = analyze.filter_bad_targets(][sample filtering]], as AC control is unidirectional we have no way to know what the real state of an AC is (the user could power it off while we still send deployments thinking it's still on), this requires [[file:skynet/utils/analyze.py::def filter_target_based_on_current_mode(][some heuristics]] to filter bad samples where the supposed AC state does not match the real AC state.
+It's important to not that those heuristics are infortuatenly based on the 3 hours max sample size condition. This hopefully can be addressed so that we could change that constant without breaking the filtering code.
+
+Now that the samples are stored in mongo, we can start training the [[file:airflow/dags/climate_models.py::task_id="climate_model_training",][climate model]] and [[file:airflow/dags/climate_models.py::task_id="mode_model_training",][mode model]].
+Currently the climate model is trained with only the last [[file:scripts/micro_models.py::N_MONTHS = 3][3 months]] of data due to memory constraints on our train instance.
+We need some [[file:scripts/micro_models.py::X, y = climate_model.make_static_climate_dataset(feats, targs)][processing]] to transform the mongo samples into a dataset.
+
+Only samples of more than [[file:skynet/prediction/climate_model.py::MIN_TARGET_POINTS = 8][40 minutes]] will actually be processed, while the target will be the sensor value [[file:skynet/sample/selection.py::STATIC_INTERPOLATION = timedelta(minutes=60)][1 hour]] from the state change. Samples less than one hour but more than 40 minutes will be extrapolated using [[file:skynet/sample/selection.py::m, b = np.polyfit(np.arange(ys.size), ys, deg=1)][linear interpolation]].
+Most of our samples are less than 20min long but as the dataset target is set to 1 hour this would severely limit the number of samples that can be used to trained our model, with extrapolation we are still able to process 40min samples as if they actually had 1 hour of data.
+
+Please not that the current implementation is extremely wasteful: samples stored in mongo can be up to 3 hours long but as we only care about the target at 1hour the remaining 2 hours won't be used to create extra samples in the training dataset, likewise many samples are less than 40min and won't even make it into the final training set. Unfortunately as previously mentioned we are not currently able to adjust the 3 hours sample split constant down to 1 hour to mitagate the sample loss because the sample filtering heuristics are based on that 3 hour constant.
+This further introduce a vicious circle: new devices or device with bad control have lots of control issues resulting in frequent set point change, as the set point changes frequently most of the samples are less than 40min, as a consequence the devices with bad control have little samples and thus we are not really able to improve the models which in the end leads the control to fail once again.
+
+The extrapolated and chunked samples with 1 hour length as thus [[file:skynet/prediction/climate_model.py::y_static = pd.concat(\[y_indexed, y_extrapolated\])][combined]] to constitute the final training dataset, the rest is simply discarded. Note that we currently use [[file:skynet/prediction/climate_model.py::if TRAIN_USING_RELATIVE_TARGET:][relative target]] for training, as previously mentioned the final model takes care of making that transparent and put's back the prediction in absolute.
+
+The climate model will be trained to predict [[file:skynet/prediction/climate_model.py::QUANTITIES = \["humidex", "humidity", "temperature"\]][temperature, humidity and humidex]].
+In case of off and fan mode we [[file:skynet/prediction/climate_model.py::X.loc\[non_active_idx, "temperature_set"\] = np.random.normal(][randomly scramble]] the set points feature to help the model learning that this feature should not affecte the output.
+
+Finally the model is [[file:scripts/micro_models.py::m.fit(X, y)][trained and saved]] in s3 as for the comfort model.
+The model is once again a [[file:skynet/prediction/climate_model.py::class ClimateModel(model.Model):][wrapper]] that is fed a [[file:skynet/prediction/estimators/climate_model.py::def get_pipeline(estimator=None):][pipeline]]. The wrapper makes sure that the model is trained with the following [[file:skynet/prediction/climate_model.py::FEATURE_COLUMNS = \[][features]], and use the same features at prediction time.
+The pipeline itself is slightly more complicated that for the comfort model, we need to properly handle the set point which can be on different scales based on the mode and the ac type (Celcius/Fahrenheit, auto/cool) - this is handled by the [[file:skynet/utils/sklearn_wrappers.py::class SetTemperatureConverter(TransformDataFrameOrDicts):][TemperatureConverter]] which uses [[file:skynet/utils/thermo.py::def fix_temperature(t) -> float:][fix_temperature]] under the hood -, we add extra [[file:skynet/prediction/estimators/climate_model.py::("set_temperature_difference", sklearn_wrappers.TemperatureSetDifference()),][features]] and we are using an [[file:skynet/prediction/estimators/climate_model.py::estimator = nnet_utils.SequenceEmbeddedRegression(][lstm]] to handle the [[file:skynet/prediction/estimators/climate_model.py::timeseries_features=\["previous_temperatures"\],][time series features]]. The pytorch models handles a bit more than lstm layer under the hood: [[file:skynet/utils/nnet_utils.py::self.create_embedding()][embedding]] of categorical features is automatically handled - this is use for device/user/appliance identifier to deal with the curse of dimensionality.
+
+** mode model
+
+The climate and mode model shares the same sample creation process, we'll just cover the actual [[file:airflow/dags/climate_models.py::task_id="mode_model_training",][model training]]. The training dataset creation leverages a good chunk of the [[file:scripts/mode_model.py::Xs, ys = climate_model.make_static_mode_dataset(X, y)][climate model processing]], the difference is simply that the mode and target have to be [[file:skynet/prediction/mode_model.py::def make_mode_model_dataset(X, targets):][exchanged]], this because while for the climate model given an ac state we want to predict the future room conditions, with the mode model given desired future room conditions we want to predict what AC mode is the most appropriate.
+
+
+* requirement update
+
+Our dependencies are kept in [[file:requirements.txt][requirements.txt]], we try to keep it short and to run the latest version most of the time. [[https://dependabot.com/][Dependabot]] is used to automatically track dependencies and create pull requests to run the CI pipeline with the new dependency version. Lots of dependencies are whitelisted as part of the dependabot configuration which means that those changes will be merge directly to master once the CI tests are passing.
+
+One of the issue with have with using the current requirements.txt is that subdependencies are not tracked, this is usually what a tool like [[https://python-poetry.org/][Poetry]] and [[https://pipenv.pypa.io/en/latest/][Pipenv]] would tackle but so far those tools do not integrate properly with [[https://github.com/pantsbuild/pex][PEX]].
+
+So far we are simply freezing the [[file:subdependencies_requirements][subdependencies]], which are then [[file:ci/build_pex.sh::cat subdependencies_requirements >> /tmp/requirements.txt][combined]] with the main requirement file as part of the CI to build the pex. This is at best a temporary hack as some of the new dependabot updates are failing as the frozen subdependencies would also need to be updated. Which means that the frozen subdependencies have to be manually updated from time to time in order to be able to merge the dependabot pull requests.
+
+This needs to be addressed and the best way would be to use pipenv or poetry to manage subdependencies (both are supported by dependabot) then use those tools to generate a requirements.txt file that can be processed by pex. Keep in mind that to speed up the CI, dependencies are [[file:.circleci/config.yml::key: pex-v2-{{ .Branch }}-{{ checksum "requirements.txt" }}][cached]] and that cache needs to match the full requirements, otherwise the CI would not be fully reproduceable between builds.
+
+* feedback effect
+
+When a user gives of feedback multiple functionalities will react to it, amongst others:
+- [[file:skynet/control/controller.py::self.tracking.penalty_factor = penalty.FEEDBACK_UPDATE_FACTOR][adjustment logic]]
+- [[file:skynet/control/comfort.py::get_adjusted_prediction(][comfort adjustment]]
+- [[file:skynet/control/tracking.py::best_setting\["temperature"\] = self.feedback_adjustment.override_temperature(][feedback override]]
+- [[file:skynet/prediction/mode_selection.py::and self.latest_feedback\["feedback"\] != 0][mode feedback override]]
+
+The adjustment logic feedback makes sure that the [[file:skynet/control/tracking.py::self.penalty_factor * error_factor * predicted_error_factor * time_factor][penalties]] on the state predictions are relaxed so that on receiving a feedback the control is not prevented from jumping the set point.
+
+The comfort adjustment makes sure that the comfort predictions which are fixed by the current comfort model running on the instance are actually updated to be closer to the recent user feedback, we cannot afford to wait a few hours so that the next version of the model trained with the new feedback might give use the expect result. This is implemented using [[file:skynet/user/comfort_model.py::time_decay_delta = exponential_time_decay(][exponantial time decay]] so that the models progressively returns to it's predictions.
+
+The feedback override is a good example of some domain knowledge logic added on top of the control loop, when the user gives a [[file:skynet/control/feedback_adjustment.py::self.feedback.get("feedback") == 3][hot feedback]] we want to make sure that the set point deployed next is at least the [[file:skynet/control/feedback_adjustment.py::return min(best_set_temp, mid_set_temp, key=float)][mid set point]] on the set point range or less. 
+
+* clp ADR offset
+
+As part of the summer 2020 Automated Demand Response (ADR) trial with CLP, we had to implement a dynamic offset at the device level. 
+
+This dynamic offset can be set up for an oncoming events by using the [[file:skynet/control/target.py::AI_OPTIMISATION_SIGNAL_LEVEL = 5][signal level 5]]. The actual dynamic offset can be configured to be [[file:utils/adr_offset_control.py::seq = sobol_seq.i4_sobol_generate(1, n) * (b - a) + a][pseudo randomly sampled]] using sobol sequences betwen a given [[file:utils/adr_offset_control.py::@click.option("--range", type=float, nargs=2)][range]].
+
+Using the script should be as easy as running:
+#+begin_src shell
+# first make sure that the production redis instance connection is redirected locally
+ssh -NL 6378:elastic-cache-1-001.qvz7qo.0001.apse1.cache.amazonaws.com:6379 user@redis.sg.ambi-labs.com
+
+# set the range of offsets to [3, 5]
+python utils/adr_offset_control.py --task set_range --range 3 5
+
+# get list of offsets
+python utils/adr_offset_control.py --task get_offsets
+#+end_src
+
+The code related to this trial can most likely be deleted once the trial is over.
+
+* upgrade model workflow
+
+When upgrading models, python version, sklearn version or pytorch version, be careful and read the [[https://github.com/AmbiLabs/ambi_brain/wiki/Upgrade-models-workflow][wiki]].
+
+As previously mentioned prediction instances automatically reload models from S3 based on the model name and metadata, when you change anything that affects directly or directly the metadata of the model, you will need to first train that model by deploy to the train instance only, after the new models are trained and available on S3 then only you can safely deploy on the pred instance.
+
+
+* scaling
+
+As mentioned on the [[https://echogroup.atlassian.net/wiki/spaces/AI/pages/1112932504/AI+Documentation+Draft#scaling][wiki]], the bottleneck of pred instance is the control process which nonetheless should be able to scale without problem up to 50k devices. The scaling of the pred instances is relatively easy, backend simply needs to provision a new pred{x} instances and AI team simply needs to update the [[file:fabfile.py::"pred": \[f"pred{i}.ai" for i in range(1, 4)\],][fab script]] to include the new instance.
+Once the AI services are deployed on the new instance, the current control process running will be able to automatically distributed the load evenly between all the pred instances.
+Make sure to monitor the load of the pred instances on [[deft:machine learning.org][new relic]], this will tell you when a new pred instance should be added. As of [2020-10-07 Wed] the current load is about 55% cpu for about 9k devices with 3 pred instances so there's still a good margin till we need to add back pred4.
+
+The bottleneck on the training is different: training and creating samples takes time and grows linearly with the number of users.
+So far we haven't automatically scaled the training, although the current load is easy to mitigate by tweaking two controls:
+- amount of data used for training ([[file:scripts/comfort_model.py::default=14,][comfort]] + [[file:scripts/micro_models.py::N_MONTHS = 3][climate]])
+- training frequency ([[file:airflow/dags/user_models.py::interval = timedelta(hours=20)][comfort]] + [[file:airflow/dags/climate_models.py::interval = timedelta(hours=20)][climate]])
+
+Make sure to monitor the train instance load on sentry as well as the task duration on the [[http://127.0.0.1:12001/admin/airflow/duration?dag_id=climate_models&days=30&root=][airflow dashboard]] (check the wiki to redirect the [[https://github.com/AmbiLabs/ambi_brain/wiki/AWS-Connections][connection]]).
+So far one of the best way to help the scaling would be to improve the throughput of the sample creation script, especially for the climate model, this could certainly be achieved by creating more samples in parallel as most likely this process is network limited.
+
+* model prediction troubleshooting
+
+We once had a case of a model trained on train and stored to s3 that was corrupted. Once the corrupted pickle file was loaded by the prediciton services on pred instances the prediction stopped working.
+
+As the models are stored with versioning on S3 it's actually really easy to delete the current (last) model from the S3 bucked or simply to restore a previous version. Models are stored for at least 2 weeks so the recovery can easily be done by using the S3 dashboard on AWS.

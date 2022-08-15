@@ -1,0 +1,16 @@
+#!/bin/bash
+python scripts/prediction_service.py --storage file --model_type climate &
+python scripts/prediction_service.py --storage file --model_type user &
+python scripts/prediction_service.py --storage file --model_type mode &
+python scripts/prediction_service.py --storage file --model_type comfort &
+
+trap ctrl_c INT
+
+function ctrl_c(){
+    kill $(jobs -p)
+    exit 0
+}
+
+while true; do
+    sleep 1
+done

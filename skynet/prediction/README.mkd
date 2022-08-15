@@ -1,0 +1,25 @@
+# Predictions
+
+## Issues
+
+Currently we are good at learning our data but it doesn't generalize well to AC
+settings that differ from those that are commonly used.
+
+Namely features that we know to be important such as the time and the set
+temperature aren't deemed very useful by the tree ensemble algorithms on top of
+all the other features.
+
+In order to remedy we've tried a few things but so far none of them as made a
+significant difference.
+
+### Using Simpler Regressors
+When using for instance a linear predictor with polynomial features, the
+predictions for different set temperatures look more plausible but the actual
+accurary of the prediction suffers a lot.
+
+This may still be an option if we train individual models for each appliance as
+in that case the coefficients of the model can be chosen optimally for each
+appliance id.
+
+### Combining Different Predictors
+The issues with this approach are similar as above.

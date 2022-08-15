@@ -1,0 +1,20 @@
+codecov:
+  bot: sveitser
+comment:
+  layout: header, changes, diff, sunburst
+  behavior: default
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        target: auto
+        threshold: 1%
+  notify:
+    hipchat:
+      default:
+        url: https://api.hipchat.com/v2/room/Skynet/notification?auth_token=YuwrkNfmn0zpIyMPOZVJ9aWLRmxEpXg4tS3c5dHe
+                
