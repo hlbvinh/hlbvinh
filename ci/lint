@@ -1,0 +1,51 @@
+#!/bin/bash
+set -e
+
+DEFAULT="scripts skynet"
+
+PEX="./python.pex"
+
+if [[ $CIRCLE_BRANCH == 'master' ]]; then
+    FILES="scripts skynet"
+    echo "MASTER build"
+else
+    FILES="$(git diff --diff-filter MA origin/master --name-only scripts skynet)"
+    echo "PR build"
+fi
+
+if [[ "$1" == "all" ]]; then
+   FILES="$DEFAULT"
+fi
+
+if [ -z "$FILES" ]; then
+    echo "No changes to pylint."
+else
+    echo "Running pylint ..."
+    echo "pylint -j 2 --output-format=parseable $FILES"
+    if [ -z "$CI" ]; then
+        pylint -j 2 --output-format=parseable $FILES
+    else
+        PEX_MODULE=pylint $PEX -j 2 --output-format=parseable $FILES
+    fi
+fi
+
+if [ -z "$CI" ]; then
+    echo "Linting locally ..."
+    echo "running flake8 $DEFAULT"
+    flake8 $DEFAULT
+    # pylint $DEFAULT
+#    echo running vulture
+#    vulture $DEFAULT utils skynet/tests whitelist.py
+#    vulture $DEFAULT utils whitelist.py --exclude skynet/tests
+else
+    echo "Linting on CI ..."
+    echo running flake8 $PEX $DEFAULT
+    PEX_MODULE=flake8 $PEX $DEFAULT
+    # echo running pylint $PEX $DEFAULT
+    # PEX_MODULE=pylint $PEX $DEFAULT
+#    echo running vulture
+#    PEX_MODULE=vulture $PEX $DEFAULT utils skynet/tests whitelist.py
+#    PEX_MODULE=vulture $PEX $DEFAULT utils whitelist.py --exclude skynet/tests
+fi
+
+echo "Linting OK!"
