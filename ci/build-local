@@ -1,0 +1,32 @@
+#!/bin/bash
+set -e
+
+if ! [ -x "$(command -v circleci)" ]; then
+    cat <<EOF
+
+    Download circleci from
+        https://circle-downloads.s3.amazonaws.com/releases/build_agent_wrapper/circleci
+    and put it in your PATH.
+
+EOF
+exit 1
+fi
+
+# Via
+# https://discuss.circleci.com/t/recommended-approach-for-accessing-private-git-repo-which-is-compatible-with-local-builds-via-the-cli/15641/2
+
+if [ -z ${GITHUB_TOKEN+x} ]; then
+    cat <<EOF
+
+    - Go to https://github.com/settings/tokens and generate token with 'repo' scope.
+    - Put token into GITHUB_TOKEN, i. e.
+
+        \$ export GITHUB_TOKEN=XZY
+        \$ ci/build-local
+
+EOF
+exit 1
+fi
+
+circleci build \
+    -e GITHUB_TOKEN=$GITHUB_TOKEN $@
