@@ -1,0 +1,3 @@
+languages: python
+verbose: true
+min-lines: 3
